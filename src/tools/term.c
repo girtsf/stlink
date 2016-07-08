@@ -45,6 +45,9 @@ struct stlinky {
 static stlink_t* gsl;
 static sigset_t sig_mask;
 
+// Whether to clean up and exit if any transfer error occurs.
+static bool g_exit_on_error = false;
+
 struct stlinky {
     stlink_t *sl;
     uint32_t off;
@@ -54,6 +57,7 @@ struct stlinky {
 void nonblock(int state);
 
 static void cleanup(int signal __attribute__((unused))) {
+    printf("cleanup\n");
     if (gsl) {
         /* Switch back to mass storage mode before closing. */
         stlink_run(gsl);
@@ -117,21 +121,33 @@ struct stlinky*  stlinky_detect(stlink_t* sl)
     return NULL;
 }
 
-static void stlinky_read_buff(struct stlinky *st, uint32_t off, uint32_t size, char *buffer)
+static void maybe_exit_on_error()
+{
+    if (g_exit_on_error) {
+        cleanup(0);
+    }
+}
+
+static ssize_t stlinky_read_buff(struct stlinky *st, uint32_t off, uint32_t size, char *buffer)
 {
     int aligned_size;
 
     if (size == 0)
-        return;
+        return 0;
 
     //Read from device with 4-byte alignment
     aligned_size = (size & 0xFFFFFFFC) + 8;
-    stlink_read_mem32(st->sl, off & 0xFFFFFFFC, aligned_size);
+    ssize_t ret = stlink_read_mem32(st->sl, off & 0xFFFFFFFC, aligned_size);
 
     //copy to local buffer
-    memcpy(buffer, st->sl->q_buf + (off & 0x3), size);
+    if (ret < 0) {
+        printf("stlinky_read_buff: failed\n");
+        maybe_exit_on_error();
+    } else {
+        memcpy(buffer, st->sl->q_buf + (off & 0x3), size);
+    }
 
-    return;
+    return ret;
 }
 
 static void stlinky_write_buf(struct stlinky *st, uint32_t off, uint32_t size, char *buffer)
@@ -145,7 +161,12 @@ size_t stlinky_rx(struct stlinky *st, char* buffer)
 {
     //read head and tail values
     uint32_t tail, head;
-    stlink_read_mem32(st->sl, st->off + RX_Q_OFFSET, sizeof(tail) + sizeof(head));
+    ssize_t ret = stlink_read_mem32(st->sl, st->off + RX_Q_OFFSET, sizeof(tail) + sizeof(head));
+    if (ret < 0) {
+        printf("stlinky_rx: reading head and tail values failed\n");
+        maybe_exit_on_error();
+        return ret;
+    }
     memcpy(&tail, &st->sl->q_buf[0], sizeof(tail));
     memcpy(&head, &st->sl->q_buf[sizeof(tail)], sizeof(head));
 
@@ -156,14 +177,20 @@ size_t stlinky_rx(struct stlinky *st, char* buffer)
     //read data
     int size_read = 0;
     if(head > tail){
-        stlinky_read_buff(st, st->off + RX_BUFF_OFFSET + tail, head - tail, buffer);
+        ret = stlinky_read_buff(st, st->off + RX_BUFF_OFFSET + tail, head - tail, buffer);
         size_read += head - tail;
     } else if(head < tail){
-        stlinky_read_buff(st, st->off + RX_BUFF_OFFSET + tail, (uint32_t) st->bufsize - tail, buffer);
+        ret = stlinky_read_buff(st, st->off + RX_BUFF_OFFSET + tail,
+            (uint32_t) st->bufsize - tail, buffer);
         size_read += st->bufsize - tail;
 
-        stlinky_read_buff(st, st->off + RX_BUFF_OFFSET, head, buffer + size_read);
+        ret = stlinky_read_buff(st, st->off + RX_BUFF_OFFSET, head, buffer + size_read);
         size_read += head;
+    }
+    if (ret < 0) {
+        printf("stlinky_rx: failed to read buffer\n");
+        maybe_exit_on_error();
+        return ret;
     }
 
     //move tail
@@ -250,24 +277,32 @@ void nonblock(int state)
 
 // Prints usage and exits.
 void usage(const char* argv0) {
-    printf("Usage: %s [-n | --no-reset] [st-linky structure offset in hex]\n", argv0);
+    printf("Usage: %s [flags] [st-linky structure offset in hex]\n", argv0);
+    printf("\n");
+    printf("  -n, --no-reset           do not reset the device\n");
+    printf("  -e, --exit-on-error      exit on any transfer error\n");
     cleanup(0);
 }
 
 static void parse_options(int argc, char* const* argv, bool* reset,
-    uint32_t* stlinky_offset)
+    bool* exit_on_error, uint32_t* stlinky_offset)
 {
     static struct option long_options[] = {
         {"help", no_argument, NULL, 'h'},
         {"no-reset", no_argument, NULL, 'n'},
+        {"exit-on-error", no_argument, NULL, 'e'},
         {0, 0, 0, 0},
     };
     int c = 0;
     int option_index = 0;
-    while ((c = getopt_long(argc, argv, "n", long_options, &option_index)) != -1) {
+    while ((c = getopt_long(argc, argv, "ne", long_options, &option_index)) != -1) {
         switch (c) {
             case 'n':
                 *reset = false;
+                break;
+            case 'e':
+                *exit_on_error = true;
+                printf("will exit on error\n");
                 break;
             case 'h':
             default:
@@ -280,7 +315,7 @@ static void parse_options(int argc, char* const* argv, bool* reset,
     } else if (optind == (argc - 1)) {
         // One arg.
         *stlinky_offset = strtol(argv[optind], NULL, 16);
-        printf("stlinky offset: %u\n", *stlinky_offset);
+        printf("stlinky offset: 0x%x\n", *stlinky_offset);
         return;
     } else {
       usage(argv[0]);
@@ -293,7 +328,7 @@ int main(int argc, char** argv) {
     bool reset = true;
     uint32_t stlinky_offset = 0;  // scan
 
-    parse_options(argc, argv, &reset, &stlinky_offset);
+    parse_options(argc, argv, &reset, &g_exit_on_error, &stlinky_offset);
 
     sig_init();
 
