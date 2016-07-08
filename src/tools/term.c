@@ -1,3 +1,4 @@
+#include <getopt.h>
 #include <stdio.h>
 #include <stdlib.h>
 /* According to POSIX.1-2001 */
@@ -247,12 +248,56 @@ void nonblock(int state)
 
 }
 
-int main(int ac, char** av) {
+// Prints usage and exits.
+void usage(const char* argv0) {
+    printf("Usage: %s [-n | --no-reset] [st-linky structure offset in hex]\n", argv0);
+    cleanup(0);
+}
+
+static void parse_options(int argc, char* const* argv, bool* reset,
+    uint32_t* stlinky_offset)
+{
+    static struct option long_options[] = {
+        {"help", no_argument, NULL, 'h'},
+        {"no-reset", no_argument, NULL, 'n'},
+        {0, 0, 0, 0},
+    };
+    int c = 0;
+    int option_index = 0;
+    while ((c = getopt_long(argc, argv, "n", long_options, &option_index)) != -1) {
+        switch (c) {
+            case 'n':
+                *reset = false;
+                break;
+            case 'h':
+            default:
+                usage(argv[0]);
+        }
+    }
+    if (optind == argc) {
+        // No more args.
+        return;
+    } else if (optind == (argc - 1)) {
+        // One arg.
+        *stlinky_offset = strtol(argv[optind], NULL, 16);
+        printf("stlinky offset: %u\n", *stlinky_offset);
+        return;
+    } else {
+      usage(argv[0]);
+    }
+}
+
+int main(int argc, char** argv) {
     struct stlinky *st=NULL;
+
+    bool reset = true;
+    uint32_t stlinky_offset = 0;  // scan
+
+    parse_options(argc, argv, &reset, &stlinky_offset);
 
     sig_init();
 
-    gsl = stlink_open_usb(10, 1, NULL);
+    gsl = stlink_open_usb(10, reset, NULL);
     if (gsl != NULL) {
         printf("ST-Linky proof-of-concept terminal :: Created by Necromant for lulz\n");
         stlink_version(gsl);
@@ -274,18 +319,16 @@ int main(int ac, char** av) {
         /* TODO: Make timeout adjustable via command line */
         sleep(1);
 
-        if(ac == 1){
+        if (stlinky_offset == 0) {
             st = stlinky_detect(gsl);
-        }else if(ac == 2){
+        } else {
             st = malloc(sizeof(struct stlinky));
             st->sl = gsl;
-            st->off = (int)strtol(av[1], NULL, 16);
+            st->off = stlinky_offset;
             printf("using stlinky at 0x%x\n", st->off);
             stlink_read_mem32(gsl, st->off + 4, 4);
             st->bufsize = READ_UINT32_LE(gsl->q_buf);
             printf("stlinky buffer size 0x%u \n", (unsigned int)st->bufsize);
-        }else{
-            cleanup(0);
         }
         if (st == NULL)
         {
