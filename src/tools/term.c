@@ -57,7 +57,6 @@ struct stlinky {
 void nonblock(int state);
 
 static void cleanup(int signal __attribute__((unused))) {
-    printf("cleanup\n");
     if (gsl) {
         /* Switch back to mass storage mode before closing. */
         stlink_run(gsl);
@@ -177,15 +176,25 @@ size_t stlinky_rx(struct stlinky *st, char* buffer)
     //read data
     int size_read = 0;
     if(head > tail){
+        uint32_t size = head - tail;
+        if (size > st->bufsize) {
+            // HACK: the size exceeds the buffer size. Perhaps the write was
+            // not atomic.
+            printf("warning: size exceeds buffer size, return, and try again\n");
+            return 0;
+        }
         ret = stlinky_read_buff(st, st->off + RX_BUFF_OFFSET + tail, head - tail, buffer);
         size_read += head - tail;
     } else if(head < tail){
+        // We wrapped.
         ret = stlinky_read_buff(st, st->off + RX_BUFF_OFFSET + tail,
             (uint32_t) st->bufsize - tail, buffer);
         size_read += st->bufsize - tail;
 
-        ret = stlinky_read_buff(st, st->off + RX_BUFF_OFFSET, head, buffer + size_read);
-        size_read += head;
+        if (ret >= 0) {
+          ret = stlinky_read_buff(st, st->off + RX_BUFF_OFFSET, head, buffer + size_read);
+          size_read += head;
+        }
     }
     if (ret < 0) {
         printf("stlinky_rx: failed to read buffer\n");
@@ -198,7 +207,27 @@ size_t stlinky_rx(struct stlinky *st, char* buffer)
 
     //write tail
     memcpy(st->sl->q_buf, &tail, sizeof(tail));
-    stlink_write_mem32(st->sl, st->off + RX_Q_OFFSET, sizeof(tail));
+    ret = stlink_write_mem32(st->sl, st->off + RX_Q_OFFSET, sizeof(tail));
+    if (ret < 0) {
+        printf("stlinky_rx: failed to update tail\n");
+        maybe_exit_on_error();
+        return ret;
+    }
+
+    // Hack: verify that the tail got updated.
+    ret = stlink_read_mem32(st->sl, st->off + RX_Q_OFFSET, sizeof(tail));
+    if (ret < 0) {
+      printf("stlinky_rx: failed to verify tail\n");
+      maybe_exit_on_error();
+      return ret;
+    }
+    uint32_t new_tail_copy;
+    memcpy(&new_tail_copy, &st->sl->q_buf[0], sizeof(tail));
+    if (new_tail_copy != tail) {
+      printf("stlinky_rx: failed to update tail\n");
+      maybe_exit_on_error();
+      return -1;
+    }
 
     return size_read;
 }
