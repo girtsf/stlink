@@ -374,7 +374,9 @@ int main(int argc, char** argv) {
         printf("cpuid:impl_id = %0#x, variant = %#x\n", cpuid.implementer_id, cpuid.variant);
         printf("cpuid:part = %#x, rev = %#x\n", cpuid.part, cpuid.revision);
 
-        stlink_reset(gsl);
+        if (reset) {
+          stlink_reset(gsl);
+        }
         stlink_force_debug(gsl);
         stlink_run(gsl);
         stlink_status(gsl);
