@@ -9,11 +9,11 @@
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
-#include <unistd.h>
 #include <sys/types.h>
 #ifdef __MINGW32__
-#include "mingw.h"
+#include <mingw.h>
 #else
+#include <unistd.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
@@ -24,13 +24,18 @@
 
 #include "gdb-remote.h"
 #include "gdb-server.h"
+#include "semihosting.h"
 
 #define FLASH_BASE 0x08000000
+
+/* Semihosting doesn't have a short option, we define a value to identify it */
+#define SEMIHOSTING_OPTION 128
 
 //Allways update the FLASH_PAGE before each use, by calling stlink_calculate_pagesize
 #define FLASH_PAGE (sl->flash_pgsz)
 
 static stlink_t *connected_stlink = NULL;
+bool semihosting = false;
 
 static const char hex[] = "0123456789abcdef";
 
@@ -72,6 +77,7 @@ int parse_options(int argc, char** argv, st_state_t *st) {
         {"listen_port", required_argument, NULL, 'p'},
         {"multi", optional_argument, NULL, 'm'},
         {"no-reset", optional_argument, NULL, 'n'},
+        {"semihosting", no_argument, NULL, SEMIHOSTING_OPTION},
         {0, 0, 0, 0},
     };
     const char * help_str = "%s - usage:\n\n"
@@ -89,6 +95,8 @@ int parse_options(int argc, char** argv, st_state_t *st) {
         "\t\t\tst-util will continue listening for connections after disconnect.\n"
         "  -n, --no-reset\n"
         "\t\t\tDo not reset board on connection.\n"
+        "  --semihosting\n"
+        "\t\t\tEnable semihosting support.\n"
         "\n"
         "The STLINKv2 device to use can be specified in the environment\n"
         "variable STLINK_DEVICE on the format <USB_BUS>:<USB_ADDR>.\n"
@@ -144,6 +152,9 @@ int parse_options(int argc, char** argv, st_state_t *st) {
                 break;
             case 'n':
                 st->reset = 0;
+                break;
+            case SEMIHOSTING_OPTION:
+                semihosting = true;
                 break;
         }
     }
@@ -405,7 +416,7 @@ static const char* const memory_map_template_F7 =
     "<memory-map>"
     "  <memory type=\"ram\" start=\"0x00000000\" length=\"0x4000\"/>"       // ITCM ram 16kB
     "  <memory type=\"rom\" start=\"0x00200000\" length=\"0x100000\"/>"     // ITCM flash
-    "  <memory type=\"ram\" start=\"0x20000000\" length=\"0x50000\"/>"      // sram
+    "  <memory type=\"ram\" start=\"0x20000000\" length=\"0x%zx\"/>"      // sram
     "  <memory type=\"flash\" start=\"0x08000000\" length=\"0x20000\">"     // Sectors 0..3
     "    <property name=\"blocksize\">0x8000</property>"                    // 32kB
     "  </memory>"
@@ -424,26 +435,28 @@ static const char* const memory_map_template_F7 =
 
 char* make_memory_map(stlink_t *sl) {
     /* This will be freed in serve() */
-    char* map = malloc(4096);
+    const size_t sz = 4096;
+    char* map = malloc(sz);
     map[0] = '\0';
 
     if(sl->chip_id==STLINK_CHIPID_STM32_F4 || sl->chip_id==STLINK_CHIPID_STM32_F446) {
         strcpy(map, memory_map_template_F4);
-    } else if(sl->chip_id==STLINK_CHIPID_STM32_F4 || sl->core_id==STM32F7_CORE_ID) {
-        strcpy(map, memory_map_template_F7);
+    } else if(sl->core_id==STM32F7_CORE_ID) {
+        snprintf(map, sz, memory_map_template_F7,
+                sl->sram_size);
     } else if(sl->chip_id==STLINK_CHIPID_STM32_F4_HD) {
         strcpy(map, memory_map_template_F4_HD);
     } else if(sl->chip_id==STLINK_CHIPID_STM32_F2) {
-        snprintf(map, 4096, memory_map_template_F2,
+        snprintf(map, sz, memory_map_template_F2,
                 sl->flash_size,
                 sl->sram_size,
                 sl->flash_size - 0x20000,
                 sl->sys_base, sl->sys_size);
     } else if(sl->chip_id==STLINK_CHIPID_STM32_L4) {
-        snprintf(map, 4096, memory_map_template_L4,
+        snprintf(map, sz, memory_map_template_L4,
                 sl->flash_size, sl->flash_size);
     } else {
-        snprintf(map, 4096, memory_map_template,
+        snprintf(map, sz, memory_map_template,
                 sl->flash_size,
                 sl->sram_size,
                 sl->flash_size, sl->flash_pgsz,
@@ -589,6 +602,16 @@ static void init_code_breakpoints(stlink_t *sl) {
         code_breaks[i].type = 0;
         stlink_write_debug32(sl, STLINK_REG_CM3_FP_COMP0 + i * 4, 0);
     }
+}
+
+static int has_breakpoint(stm32_addr_t addr)
+{
+    for(int i = 0; i < code_break_num; i++) {
+        if (code_breaks[i].addr == addr) {
+            return 1;
+        }
+    }
+    return 0;
 }
 
 static int update_code_breakpoint(stlink_t *sl, stm32_addr_t addr, int set) {
@@ -927,6 +950,21 @@ static void cache_sync(stlink_t *sl)
     cache_flush(sl, ccr);
 }
 
+static size_t unhexify(const char *in, char *out, size_t out_count)
+{
+    size_t i;
+    unsigned int c;
+
+    for (i = 0; i < out_count; i++) {
+        if (sscanf(in + (2 * i), "%02x", &c) != 1) {
+            return i;
+        }
+        out[i] = (char)c;
+    }
+
+    return i;
+}
+
 int serve(stlink_t *sl, st_state_t *st) {
     int sock = socket(AF_INET, SOCK_STREAM, 0);
     if(sock < 0) {
@@ -1018,7 +1056,7 @@ int serve(stlink_t *sl, st_state_t *st) {
 
                 if(!strcmp(queryName, "Supported")) {
                     if(sl->chip_id==STLINK_CHIPID_STM32_F4
-		       || sl->chip_id==STLINK_CHIPID_STM32_F4_HD
+                       || sl->chip_id==STLINK_CHIPID_STM32_F4_HD
                        || sl->core_id==STM32F7_CORE_ID) {
                         reply = strdup("PacketSize=3fff;qXfer:memory-map:read+;qXfer:features:read+");
                     }
@@ -1073,20 +1111,34 @@ int serve(stlink_t *sl, st_state_t *st) {
                         params = separator + 1;
                     }
 
+                    size_t hex_len = strlen(params);
+                    size_t alloc_size = (hex_len / 2) + 1;
+                    size_t cmd_len;
+                    char *cmd = malloc(alloc_size);
 
-                    if (!strncmp(params,"726573756d65",12)) {// resume
+                    if (cmd == NULL) {
+                        DLOG("Rcmd unhexify allocation error\n");
+                        break;
+                    }
+
+                    cmd_len = unhexify(params, cmd, alloc_size - 1);
+                    cmd[cmd_len] = 0;
+
+                    DLOG("unhexified Rcmd: '%s'\n", cmd);
+
+                    if (!strncmp(cmd, "resume", 6)) {// resume
                         DLOG("Rcmd: resume\n");
                         cache_sync(sl);
                         stlink_run(sl);
 
                         reply = strdup("OK");
-                    } else if (!strncmp(params,"68616c74",8)) { //halt
+                    } else if (!strncmp(cmd, "halt", 4)) { //halt
                         reply = strdup("OK");
 
                         stlink_force_debug(sl);
 
                         DLOG("Rcmd: halt\n");
-                    } else if (!strncmp(params,"6a7461675f7265736574",20)) { //jtag_reset
+                    } else if (!strncmp(cmd, "jtag_reset", 10)) { //jtag_reset
                         reply = strdup("OK");
 
                         stlink_jtag_reset(sl, 0);
@@ -1094,7 +1146,7 @@ int serve(stlink_t *sl, st_state_t *st) {
                         stlink_force_debug(sl);
 
                         DLOG("Rcmd: jtag_reset\n");
-                    } else if (!strncmp(params,"7265736574",10)) { //reset
+                    } else if (!strncmp(cmd, "reset", 5)) { //reset
                         reply = strdup("OK");
 
                         stlink_force_debug(sl);
@@ -1103,10 +1155,32 @@ int serve(stlink_t *sl, st_state_t *st) {
                         init_data_watchpoints(sl);
 
                         DLOG("Rcmd: reset\n");
-                    } else {
-                        DLOG("Rcmd: %s\n", params);
-                    }
+                    } else if (!strncmp(cmd, "semihosting ", 12)) {
+                        DLOG("Rcmd: got semihosting cmd '%s'", cmd);
+                        char *arg = cmd + 12;
 
+                        /* Skip whitespaces */
+                        while (isspace(*arg)) {
+                            arg++;
+                        }
+
+                        if (!strncmp(arg, "enable", 6)
+                            || !strncmp(arg, "1", 1))
+                        {
+                            semihosting = true;
+                            reply = strdup("OK");
+                        } else if (!strncmp(arg, "disable", 7)
+                            || !strncmp(arg, "0", 1))
+                        {
+                            semihosting = false;
+                            reply = strdup("OK");
+                        } else {
+                            DLOG("Rcmd: unknown semihosting arg: '%s'\n", arg);
+                        }
+                    } else {
+                        DLOG("Rcmd: %s\n", cmd);
+                    }
+                    free(cmd);
                 }
 
                 if(reply == NULL)
@@ -1215,7 +1289,55 @@ int serve(stlink_t *sl, st_state_t *st) {
 
                     stlink_status(sl);
                     if(sl->core_stat == STLINK_CORE_HALTED) {
-                        break;
+                        struct stlink_reg reg;
+                        int ret;
+                        stm32_addr_t pc;
+                        stm32_addr_t addr;
+                        int offset = 0;
+                        uint16_t insn;
+
+                        if (!semihosting) {
+                            break;
+                        }
+
+                        stlink_read_all_regs (sl, &reg);
+
+                        /* Read PC */
+                        pc = reg.r[15];
+
+                        /* Compute aligned value */
+                        offset = pc % 4;
+                        addr = pc - offset;
+
+                        /* Read instructions (address and length must be
+                         * aligned).
+                         */
+                        ret = stlink_read_mem32(sl, addr, (offset > 2 ? 8 : 4));
+
+                        if (ret != 0) {
+                            DLOG("Semihost: cannot read instructions at: "
+                                 "0x%08x\n", addr);
+                            break;
+                        }
+
+                        memcpy(&insn, &sl->q_buf[offset], sizeof(insn));
+
+                        if (insn == 0xBEAB && !has_breakpoint(addr)) {
+
+                            do_semihosting (sl, reg.r[0], reg.r[1], &reg.r[0]);
+
+                            /* Write return value */
+                            stlink_write_reg(sl, reg.r[0], 0);
+
+                            /* Jump over the break instruction */
+                            stlink_write_reg(sl, reg.r[15] + 2, 15);
+
+                            /* continue execution */
+                            cache_sync(sl);
+                            stlink_run(sl);
+                        } else {
+                            break;
+                        }
                     }
 
                     usleep(100000);

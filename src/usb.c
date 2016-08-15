@@ -45,7 +45,7 @@ ssize_t send_recv(struct stlink_libusb* handle, int terminate,
         return -1;
     } else if ((size_t)res != txsize) {
         printf("[!] send_recv send request wrote %u bytes (instead of %u).\n",
-	       (unsigned int)res, (unsigned int)txsize);
+       (unsigned int)res, (unsigned int)txsize);
     }
 
     if (rxsize != 0) {
@@ -880,6 +880,7 @@ stlink_t *stlink_open_usb(enum ugly_loglevel verbose, bool reset, char serial[16
     }
 
     if (reset) {
+        stlink_jtag_reset(sl, 2);
         stlink_reset(sl);
         usleep(10000);
     }
